@@ -1,0 +1,86 @@
+name: Promote Package to Production
+
+on:
+  repository_dispatch:
+    types: [package-synced]
+
+env:
+  CLOUDSMITH_NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+  STAGING_REPO: staging
+  PRODUCTION_REPO: production
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Debug input
+        run: |
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Client payload keys: $(jq '.client_payload' < $GITHUB_EVENT_PATH || true)"
+          echo "package_name: ${{ github.event.client_payload.package_name }}"
+          echo "package_version: ${{ github.event.client_payload.package_version }}"
+          echo "package_identifier: ${{ github.event.client_payload.package_identifier }}"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Install Cloudsmith CLI via action (OIDC)
+        uses: cloudsmith-io/cloudsmith-cli-action@v1.0.3
+        with:
+          oidc-namespace: ${{ env.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ vars.CLOUDSMITH_SERVICE_SLUG }}
+
+      - name: Add ready-for-production tag to the synced package
+        run: |
+          # If webhook provided an identifier, use it; otherwise try to locate by name/version.
+          IDENTIFIER="${{ github.event.client_payload.package_identifier }}"
+          NAME="${{ github.event.client_payload.package_name }}"
+          VERSION="${{ github.event.client_payload.package_version }}"
+
+          if [ -z "$IDENTIFIER" ] || [ "$IDENTIFIER" = "null" ]; then
+            echo "Identifier missing; searching by name/version"
+            # Search cloudsmith for matching package name + version
+            QUERY="name:${NAME} version:${VERSION}"
+            echo "Query: $QUERY"
+            RESPONSE=$(cloudsmith list packages ${{ env.CLOUDSMITH_NAMESPACE }}/${{ env.STAGING_REPO }} -q "$QUERY" -F json)
+            IDENTIFIER=$(echo "$RESPONSE" | jq -r '.data[0].identifier_perm // empty')
+          fi
+
+          if [ -z "$IDENTIFIER" ]; then
+            echo "ERROR: Could not find package identifier. Exiting."
+            cat <<EOF
+Response from list:
+$RESPONSE
+EOF
+            exit 1
+          fi
+
+          echo "Found identifier: $IDENTIFIER"
+
+          # Add tag ready-for-production
+          cloudsmith tags add ${{ env.CLOUDSMITH_NAMESPACE }}/${{ env.STAGING_REPO }}/${IDENTIFIER} ready-for-production
+          echo "Tagged $IDENTIFIER as ready-for-production"
+
+      - name: Find all packages with tag ready-for-production and promote to production
+        run: |
+          echo "Listing all packages in staging as JSON"
+          ALL_JSON=$(cloudsmith list packages ${{ env.CLOUDSMITH_NAMESPACE }}/${{ env.STAGING_REPO }} -F json)
+          echo "$ALL_JSON" | jq -r '.data[] | select(.tags | any(.name == "ready-for-production")) | .identifier_perm' > /tmp/ready_ids.txt
+
+          echo "Packages marked ready-for-production:"
+          cat /tmp/ready_ids.txt || true
+
+          while read -r ID; do
+            if [ -z "$ID" ]; then
+              continue
+            fi
+            echo "Promoting $ID from ${{ env.STAGING_REPO }} to ${{ env.PRODUCTION_REPO }}"
+            # Move the package from staging to production
+            cloudsmith move ${{ env.CLOUDSMITH_NAMESPACE }}/${{ env.STAGING_REPO }}/$ID ${{ env.PRODUCTION_REPO }}
+          done < /tmp/ready_ids.txt
